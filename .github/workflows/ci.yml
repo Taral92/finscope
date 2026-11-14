@@ -1,0 +1,38 @@
+# The same four checks CLAUDE.md asks for before every change, run on every push and PR.
+# No secrets needed: the tests use fake SEC and LLM providers, and the one integration test
+# that hits the real SEC is excluded by default (pytest addopts in pyproject.toml).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install Python (version from .python-version)
+        run: uv python install
+
+      - name: Install dependencies exactly as locked
+        run: uv sync --locked
+
+      - name: Lint
+        run: uv run ruff check
+
+      - name: Format
+        run: uv run ruff format --check
+
+      - name: Type-check
+        run: uv run mypy src
+
+      - name: Test
+        run: uv run pytest
