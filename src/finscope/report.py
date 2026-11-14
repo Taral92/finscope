@@ -75,9 +75,10 @@ class SectionReport(BaseModel):
     high: tuple[HighItem, ...]  # explained (or attempted) high changes, in diff order
     not_explained: tuple[RatedItem, ...]  # high changes over the max_explain cap, in diff order
     medium: tuple[RatedItem, ...]
-    triage_runs: int  # triage runs attempted
-    triage_succeeded: int
-    triage_errors: tuple[str, ...]  # one per failed triage run
+    # Defaults describe a report saved before several triage runs existed: one run, it worked.
+    triage_runs: int = 1  # triage runs attempted
+    triage_succeeded: int = 1
+    triage_errors: tuple[str, ...] = ()  # one per failed triage run
     # Totals over every call: each triage run plus each agent run, failed runs included.
     input_tokens: int
     output_tokens: int
