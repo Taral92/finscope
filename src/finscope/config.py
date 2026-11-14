@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     llm_input_price_per_mtok: Decimal | None = Decimal("1.00")
     llm_output_price_per_mtok: Decimal | None = Decimal("5.00")
 
+    # Telegram alerts. The bot token (from @BotFather) is a password: SecretStr, never printed.
+    # The chat ID says where alerts go; `python -m finscope telegram-chat-id` finds yours.
+    telegram_bot_token: SecretStr | None = None
+    telegram_chat_id: str | None = None
+
     @field_validator("sec_user_agent")
     @classmethod
     def _require_email(cls, value: str) -> str:

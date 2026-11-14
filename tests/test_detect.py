@@ -1,5 +1,5 @@
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 import pytest
+from pydantic import SecretStr
 
 import finscope.__main__ as cli
 from finscope.__main__ import _run_check
@@ -33,6 +34,7 @@ from finscope.llm import (
     ToolResult,
     ToolSpec,
 )
+from finscope.notify import TelegramNotifier
 
 SETTINGS = Settings(
     _env_file=None,
@@ -188,6 +190,8 @@ def check(
     include_unseen: bool = False,
     dry_run: bool = False,
     triage_runs: int = 1,
+    notify: bool = False,
+    notifier: TelegramNotifier | None = None,
 ) -> int:
     return _run_check(
         entries,
@@ -198,6 +202,8 @@ def check(
         dry_run=dry_run,
         max_explain=5,
         triage_runs=triage_runs,
+        notify=notify,
+        notifier=notifier,
     )
 
 
@@ -523,3 +529,128 @@ def test_a_bad_watchlist_fails_clearly(tmp_path: Path, content: str, message: st
 def test_a_missing_watchlist_fails_clearly(tmp_path: Path) -> None:
     with pytest.raises(WatchlistError, match="can't read"):
         load_watchlist(tmp_path / "missing.json")
+
+
+TELEGRAM_TOKEN = "123456:SECRET-test-token"
+TELEGRAM_SETTINGS = SETTINGS.model_copy(
+    update={"telegram_bot_token": SecretStr(TELEGRAM_TOKEN), "telegram_chat_id": "42"}
+)
+
+
+class Telegram:
+    """Stand-in for the Bot API. Runs `on_send` first, so a test can look at disk then."""
+
+    def __init__(
+        self,
+        response: httpx.Response | None = None,
+        on_send: Callable[[], None] | None = None,
+    ) -> None:
+        self.texts: list[str] = []
+        self.response = response or httpx.Response(200, json={"ok": True, "result": {}})
+        self.on_send = on_send
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        if self.on_send is not None:
+            self.on_send()
+        self.texts.append(json.loads(request.content)["text"])
+        return self.response
+
+    def notifier(self) -> TelegramNotifier:
+        return TelegramNotifier(TELEGRAM_SETTINGS, transport=httpx.MockTransport(self.handle))
+
+
+def test_check_sends_the_alert_after_saving_the_report_and_state(
+    sec: SecClient, edgar: FakeEdgar, capsys: pytest.CaptureFixture[str]
+) -> None:
+    edgar.set_filings("TSLA", NEW, OLD)
+    remember(sec, TSLA, OLD)
+    report_path = reports_dir(sec.data_dir) / f"TSLA_10-K_{NEW[0]}_I-1A.json"
+
+    def saved_first() -> None:
+        assert report_path.exists(), "the report must be saved before sending"
+        assert remembered(sec, TSLA) == NEW[0], "the state must be updated before sending"
+
+    telegram = Telegram(on_send=saved_first)
+
+    assert check(sec, Providers(), notify=True, notifier=telegram.notifier()) == 0
+
+    [text] = telegram.texts
+    assert text.startswith("FinScope: TSLA 10-K, 1 alert\n")
+    assert f"Filed 2026-01-29, accession {NEW[0]}" in text
+    assert "ALERT [+1]\nWHAT CHANGED: Robotaxi expansion risk added." in text
+    assert "alerts sent to Telegram" in capsys.readouterr().out
+
+
+def test_a_failed_send_warns_but_keeps_the_report_and_state(
+    sec: SecClient, edgar: FakeEdgar, capsys: pytest.CaptureFixture[str]
+) -> None:
+    edgar.set_filings("TSLA", NEW, OLD)
+    remember(sec, TSLA, OLD)
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(f"connection refused for {request.url}", request=request)
+
+    bot = TelegramNotifier(TELEGRAM_SETTINGS, transport=httpx.MockTransport(refuse))
+
+    assert check(sec, Providers(), notify=True, notifier=bot) == 0
+
+    assert remembered(sec, TSLA) == NEW[0]
+    assert [path.name for path in saved_reports(sec)] == [f"TSLA_10-K_{NEW[0]}_I-1A.json"]
+    captured = capsys.readouterr()
+    assert "warning: alerts not sent: Telegram sendMessage failed: ConnectError" in captured.err
+    assert "none failed" in captured.out
+    assert TELEGRAM_TOKEN not in captured.out + captured.err
+
+
+def test_check_without_telegram_configured_says_so(
+    sec: SecClient, edgar: FakeEdgar, capsys: pytest.CaptureFixture[str]
+) -> None:
+    edgar.set_filings("TSLA", NEW, OLD)
+    remember(sec, TSLA, OLD)
+
+    assert check(sec, Providers(), notify=True, notifier=None) == 0
+
+    assert "alerts not sent: Telegram not configured" in capsys.readouterr().out
+    assert remembered(sec, TSLA) == NEW[0]
+
+
+@pytest.mark.parametrize(
+    ("dry_run", "notify"),
+    [(True, True), (False, False)],  # --dry-run; --no-notify
+)
+def test_dry_run_and_no_notify_send_nothing(
+    sec: SecClient, edgar: FakeEdgar, dry_run: bool, notify: bool
+) -> None:
+    edgar.set_filings("TSLA", NEW, OLD)
+    remember(sec, TSLA, OLD)
+    telegram = Telegram()
+    bot = telegram.notifier()
+
+    assert check(sec, Providers(), dry_run=dry_run, notify=notify, notifier=bot) == 0
+
+    assert telegram.texts == []
+
+
+def test_nothing_is_sent_when_nothing_was_compared(sec: SecClient, edgar: FakeEdgar) -> None:
+    edgar.set_filings("TSLA", NEW, OLD)  # first sight: only remembered
+    telegram = Telegram()
+
+    assert check(sec, Providers(), notify=True, notifier=telegram.notifier()) == 0
+
+    assert telegram.texts == []
+
+
+@pytest.mark.parametrize(("flag", "expected"), [([], False), (["--no-notify"], True)])
+def test_check_command_passes_no_notify_through(
+    monkeypatch: pytest.MonkeyPatch, flag: list[str], expected: bool
+) -> None:
+    seen: dict[str, Any] = {}
+
+    def fake_check(**kwargs: Any) -> int:
+        seen.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(cli, "_check", fake_check)
+
+    assert cli.main(["check", *flag]) == 0
+    assert seen["no_notify"] is expected

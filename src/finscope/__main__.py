@@ -16,13 +16,17 @@ python -m finscope eval-triage TSLA --item 1A [--runs 3]   score AI triage again
 python -m finscope eval-known [--runs 3]                score AI triage on made-up known cases
 python -m finscope eval-agent TSLA --item 1A [--runs 3] [--ids '~4,~11']  agent stability eval
 python -m finscope eval-known-agent [--runs 2]          score the agent's importance on known cases
-python -m finscope check [--dry-run] [--include-unseen] [--triage-runs 1]  report on newly
-                                                    filed watched sections
+python -m finscope check [--dry-run] [--include-unseen] [--triage-runs 1] [--no-notify]
+                                                    report on newly filed watched sections
+python -m finscope feedback [--report NAME] [--redo]   rate a report's alerts (feeds evals)
+python -m finscope telegram-chat-id                 chats that messaged your Telegram bot
+python -m finscope notify-test                      send a test message to your Telegram chat
 """
 
 import argparse
 import os
 import sys
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -85,6 +89,14 @@ from finscope.evals import (
     score_triage,
 )
 from finscope.explain import explain_change, explain_change_with_agent
+from finscope.feedback import (
+    FeedbackError,
+    ask_feedback,
+    feedback_dir,
+    load_report,
+    newest_report,
+    save_feedback,
+)
 from finscope.filings import load_filing_text
 from finscope.known_agent import (
     AgentCaseResult,
@@ -107,6 +119,12 @@ from finscope.known_cases import (
 )
 from finscope.labels import LABELS_DIR, LabelsError, SectionLabels, label_changes, load_labels
 from finscope.llm import LLMError, LLMProvider, OpenAIProvider
+from finscope.notify import (
+    NotifyError,
+    TelegramNotifier,
+    format_alert_message,
+    telegram_configured,
+)
 from finscope.report import HighItem, SectionReport, build_section_report
 from finscope.sections import Section, split_sections
 from finscope.triage import (
@@ -272,6 +290,24 @@ def main(argv: list[str] | None = None) -> int:
         default=1,
         help="per section: triage runs; high in any run counts as high (default 1)",
     )
+    check_parser.add_argument(
+        "--no-notify", action="store_true", help="don't send alerts to Telegram"
+    )
+
+    feedback_parser = commands.add_parser(
+        "feedback", help="rate a report's alerts useful, not_useful or wrong (feeds evals)"
+    )
+    feedback_parser.add_argument(
+        "--report", help="a file name in data/reports (default: the newest without feedback)"
+    )
+    feedback_parser.add_argument(
+        "--redo", action="store_true", help="ask again even if the report already has feedback"
+    )
+
+    commands.add_parser(
+        "telegram-chat-id", help="list the chats that messaged your Telegram bot, with their IDs"
+    )
+    commands.add_parser("notify-test", help="send a test message to your Telegram chat")
 
     args = parser.parse_args(argv)
 
@@ -287,7 +323,15 @@ def main(argv: list[str] | None = None) -> int:
             include_unseen=args.include_unseen,
             max_explain=args.max_explain,
             triage_runs=args.triage_runs,
+            no_notify=args.no_notify,
         )
+    # Reads saved reports only: no SEC data, no AI calls.
+    if args.command == "feedback":
+        return _feedback(get_settings().data_dir, report=args.report, redo=args.redo)
+    if args.command == "telegram-chat-id":
+        return _telegram_chat_id(get_settings())
+    if args.command == "notify-test":
+        return _notify_test(get_settings())
 
     with SecClient() as sec:
         try:
@@ -844,24 +888,34 @@ def _count(number: int, noun: str) -> str:
     return f"{number} {noun}{'' if number == 1 else 's'}"
 
 
-def _check(*, dry_run: bool, include_unseen: bool, max_explain: int, triage_runs: int) -> int:
+def _check(
+    *, dry_run: bool, include_unseen: bool, max_explain: int, triage_runs: int, no_notify: bool
+) -> int:
     try:
         entries = load_watchlist(WATCHLIST_PATH)
     except WatchlistError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
     settings = get_settings()
-    with SecClient(settings) as sec:
-        return _run_check(
-            entries,
-            sec=sec,
-            settings=settings,
-            make_providers=lambda: _report_providers(settings),
-            include_unseen=include_unseen,
-            dry_run=dry_run,
-            max_explain=max_explain,
-            triage_runs=triage_runs,
-        )
+    notify = not dry_run and not no_notify
+    notifier = TelegramNotifier(settings) if notify and telegram_configured(settings) else None
+    try:
+        with SecClient(settings) as sec:
+            return _run_check(
+                entries,
+                sec=sec,
+                settings=settings,
+                make_providers=lambda: _report_providers(settings),
+                include_unseen=include_unseen,
+                dry_run=dry_run,
+                max_explain=max_explain,
+                triage_runs=triage_runs,
+                notify=notify,
+                notifier=notifier,
+            )
+    finally:
+        if notifier is not None:
+            notifier.close()
 
 
 def _run_check(
@@ -874,8 +928,13 @@ def _run_check(
     dry_run: bool,
     max_explain: int,
     triage_runs: int,
+    notify: bool,
+    notifier: TelegramNotifier | None,
 ) -> int:
-    """Check every entry; one failing entry doesn't stop the others. 1 if any failed."""
+    """Check every entry; one failing entry doesn't stop the others. 1 if any failed.
+
+    With `notify`, each saved report's alerts go to `notifier` (None: Telegram not configured).
+    """
     path = state_path(sec.data_dir)
     try:
         state = load_state(path)
@@ -889,7 +948,7 @@ def _run_check(
     for entry in entries:
         print(f"\n=== {entry.label} ===")
         try:
-            seen = _check_entry(
+            seen, result = _check_entry(
                 entry,
                 state.get(entry.key),
                 sec=sec,
@@ -906,6 +965,10 @@ def _run_check(
                 updated = {**state, entry.key: seen}
                 save_state(updated, path)
                 state = updated
+            # Sent last, once the report is saved and the state updated: a failed send loses
+            # nothing, the report is on disk.
+            if result is not None and notify and not dry_run:
+                _send_alert(result, notifier, reports_dir(sec.data_dir) / result.file_name)
         except Exception as error:  # any failure: report it, keep the old state, go on
             failed.append(entry.label)
             print(f"error: {entry.label}: {type(error).__name__}: {error}", file=sys.stderr)
@@ -928,8 +991,9 @@ def _check_entry(
     dry_run: bool,
     max_explain: int,
     triage_runs: int,
-) -> SeenFiling | None:
-    """Check one entry. Returns what to remember now, or None to leave its state as it is."""
+) -> tuple[SeenFiling | None, CheckResult | None]:
+    """Check one entry. Returns what to remember now (None: leave the state as it is) and the
+    saved result, if a report was run."""
     cik = sec.get_cik(entry.ticker)
     # The form filter is an exact match, so amendments (e.g. 10-K/A) are excluded.
     filings = sec.get_recent_filings(cik, forms={entry.form}, limit=2)
@@ -937,13 +1001,13 @@ def _check_entry(
     new = plan.new
     if plan.action == "unchanged":
         print(f"no new filing (newest is still {_filing_label(new)})")
-        return None
+        return None, None
     if plan.action == "start":
         if dry_run:
             print(f"would start watching from {_filing_label(new)}; no AI calls")
-            return None
+            return None, None
         print(f"now watching, starting from {_filing_label(new)}")
-        return _seen(new)
+        return _seen(new), None
 
     old = plan.old
     if old is None:  # a compare plan always has both filings
@@ -958,7 +1022,7 @@ def _check_entry(
             f"would compare {_filing_label(new)} with {_filing_label(old)}: "
             f"{triage_runs} triage run(s) + up to {max_explain} agent run(s)"
         )
-        return None
+        return None, None
 
     triage_provider, agent_provider = providers()
     _print_filing_pair(old, new)
@@ -989,7 +1053,119 @@ def _check_entry(
     saved = save_check_result(result, reports_dir(sec.data_dir))
     _print_check_summary(report, decision, saved)
     # Remembered only now, after the report is saved: a failure above means a retry next time.
-    return _seen(new)
+    return _seen(new), result
+
+
+def _send_alert(result: CheckResult, notifier: TelegramNotifier | None, saved: Path) -> None:
+    """Send the result's alerts, if any. A failure only warns: the report is already saved."""
+    message = format_alert_message(result)
+    if message is None:
+        return
+    if notifier is None:
+        print("alerts not sent: Telegram not configured")
+        return
+    try:
+        notifier.send(message)
+    except NotifyError as error:
+        print(f"warning: alerts not sent: {error} (the report is saved: {saved})", file=sys.stderr)
+        return
+    print("alerts sent to Telegram")
+
+
+def _feedback(data_dir: Path, *, report: str | None, redo: bool) -> int:
+    reports, answers = reports_dir(data_dir), feedback_dir(data_dir)
+    try:
+        if report is None:
+            path = newest_report(reports, answers, include_answered=redo)
+            if path is None:
+                if any(reports.glob("*.json")):
+                    print(f"nothing to rate: every report in {reports} has feedback (see --redo)")
+                else:
+                    print(f"nothing to rate: no reports in {reports}; run `check` first")
+                return 0
+        else:
+            path = reports / (report if report.endswith(".json") else f"{report}.json")
+        saved = answers / path.name
+        if saved.exists() and not redo:
+            print(
+                f"error: {path.name} already has feedback: {saved} (--redo asks again)",
+                file=sys.stderr,
+            )
+            return 1
+        result = load_report(path)
+    except FeedbackError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+    decision = result.decision
+    alerts, reviews, digests = (
+        decision.tier("alert"),
+        decision.tier("review"),
+        decision.tier("digest"),
+    )
+    filing = result.new_filing
+    print(f"{result.entry.label}: filed {_filing_label(filing)}")
+    print(f"report: {path} (checked {result.checked_at.isoformat(timespec='minutes')})")
+    print(f"{len(alerts)} alert(s), {len(reviews)} to review, {len(digests)} digest\n")
+    if not alerts and not reviews:
+        # Marked as done with an empty file, so the next run moves on to another report.
+        save_feedback((), saved)
+        print(f"nothing to rate: no alerts and nothing to review. Saved (no answers): {saved}")
+        return 0
+
+    try:
+        # input and print are passed here, not defaulted in feedback.py, so the command
+        # reads the terminal and the tests can replace input().
+        feedback = ask_feedback(result, saved, ask=input, show=print)
+    except (KeyboardInterrupt, EOFError):  # Ctrl+C or Ctrl+D: every answer is already saved
+        if saved.exists():
+            print(f"\nStopped. Every answer so far is saved in {saved}")
+        else:
+            print("\nStopped before the first answer; nothing saved")
+        return 0
+    counts = Counter(answer.verdict for answer in feedback)
+    missed = sum(1 for answer in feedback if answer.tier == "digest")
+    print(
+        f"\n{len(feedback)} answer(s): {counts['useful']} useful, "
+        f"{counts['not_useful']} not_useful, {counts['wrong']} wrong "
+        f"(incl. {missed} missed alert{'' if missed == 1 else 's'} from the digest)"
+    )
+    print(f"Saved: {saved}")
+    return 0
+
+
+def _telegram_chat_id(settings: Settings) -> int:
+    try:
+        with TelegramNotifier(settings) as notifier:
+            chats = notifier.chats()
+    except NotifyError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    if not chats:
+        print("no chats yet: send your bot a message in Telegram, then run this again")
+        return 0
+    for chat_id, name in chats:
+        print(f"{chat_id}  {name}")
+    print("put yours in .env as FINSCOPE_TELEGRAM_CHAT_ID")
+    return 0
+
+
+def _notify_test(settings: Settings) -> int:
+    if not telegram_configured(settings):
+        print(
+            "error: Telegram not configured: set FINSCOPE_TELEGRAM_BOT_TOKEN and "
+            "FINSCOPE_TELEGRAM_CHAT_ID",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        with TelegramNotifier(settings) as notifier:
+            notifier.send("FinScope test message")
+    except NotifyError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    print("test message sent")
+    return 0
 
 
 def _seen(filing: Filing) -> SeenFiling:
