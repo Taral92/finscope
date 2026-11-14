@@ -19,6 +19,7 @@ python -m finscope eval-known-agent [--runs 2]          score the agent's import
 python -m finscope check [--dry-run] [--include-unseen] [--triage-runs 1] [--no-notify]
                                                     report on newly filed watched sections
 python -m finscope feedback [--report NAME] [--redo]   rate a report's alerts (feeds evals)
+python -m finscope eval-alerts                      score alert precision from your feedback
 python -m finscope telegram-chat-id                 chats that messaged your Telegram bot
 python -m finscope notify-test                      send a test message to your Telegram chat
 """
@@ -46,6 +47,13 @@ from finscope.agent_eval import (
     summarize,
 )
 from finscope.agent_tools import ExplainContext
+from finscope.alert_eval import (
+    AlertEvalResult,
+    load_all_feedback,
+    save_alert_eval,
+    score_reports,
+    summarize_alerts,
+)
 from finscope.config import Settings, get_settings
 from finscope.decide import Decision, DecisionEntry, Tier, decide
 from finscope.detect import (
@@ -305,6 +313,10 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     commands.add_parser(
+        "eval-alerts", help="score alert precision from your feedback (no AI calls)"
+    )
+
+    commands.add_parser(
         "telegram-chat-id", help="list the chats that messaged your Telegram bot, with their IDs"
     )
     commands.add_parser("notify-test", help="send a test message to your Telegram chat")
@@ -328,6 +340,8 @@ def main(argv: list[str] | None = None) -> int:
     # Reads saved reports only: no SEC data, no AI calls.
     if args.command == "feedback":
         return _feedback(get_settings().data_dir, report=args.report, redo=args.redo)
+    if args.command == "eval-alerts":
+        return _eval_alerts(feedback_dir(get_settings().data_dir), RESULTS_DIR)
     if args.command == "telegram-chat-id":
         return _telegram_chat_id(get_settings())
     if args.command == "notify-test":
@@ -1132,6 +1146,48 @@ def _feedback(data_dir: Path, *, report: str | None, redo: bool) -> int:
     )
     print(f"Saved: {saved}")
     return 0
+
+
+def _eval_alerts(feedback: Path, results_dir: Path) -> int:
+    """Score every feedback file, print per-report lines and the totals, save the result."""
+    try:
+        answers = load_all_feedback(feedback)
+    except FeedbackError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    scores = score_reports(answers)
+    if not scores:
+        print(f"error: no feedback in {feedback}; run `feedback` first", file=sys.stderr)
+        return 1
+    result = summarize_alerts(scores, datetime.now(UTC))
+    saved = save_alert_eval(result, results_dir)
+    _print_alert_eval(result)
+    print(f"saved:  {saved}")
+    return 0
+
+
+def _print_alert_eval(result: AlertEvalResult) -> None:
+    print(f"=== PER REPORT ({len(result.reports)}) ===")
+    for score in result.reports:
+        print(
+            f"{score.report}  checked {score.checked_at:%Y-%m-%d}\n"
+            f"  alerts {score.alerts_rated}: {len(score.useful)} useful, "
+            f"{len(score.not_useful)} not_useful, {len(score.wrong)} wrong   "
+            f"precision {_pct(score.precision)}   "
+            f"reviews useful {score.reviews_useful}/{score.reviews_rated}   "
+            f"missed {len(score.missed)}"
+        )
+        if score.wrong:
+            print(f"  wrong:  {', '.join(score.wrong)}")
+        if score.missed:
+            print(f"  missed: {', '.join(score.missed)}")
+
+    print("\n=== TOTAL ===")
+    print(f"alerts rated:     {result.alerts_rated}")
+    print(f"alert precision:  {_pct(result.precision)}  (useful / rated)")
+    print(f"wrong:            {_pct(result.wrong_rate)}  (false or misleading, fact-check passed)")
+    print(f"reviews useful:   {result.reviews_useful}/{result.reviews_rated}")
+    print(f"missed alerts:    {result.missed}  (digest entries you wanted as alerts)")
 
 
 def _telegram_chat_id(settings: Settings) -> int:
